@@ -143,12 +143,23 @@ jobs:
               path.write_text(json.dumps(data, indent=2) + "\n")
 
           patch_manifest(Path("qpm.json"))
-          shared = json.loads(Path("qpm.shared.json").read_text())
-          patch_manifest(Path("qpm.shared.json"), nested=True)
+          shared_path = Path("qpm.shared.json")
+          shared = json.loads(shared_path.read_text())
+          cfg = shared["config"]
+          cfg.setdefault("workspace", {})["ndk"] = ndk
+          seen = set()
+          for dep in cfg.get("dependencies", []):
+              dep_id = dep["id"]
+              if dep_id in ranges:
+                  dep["versionRange"] = ranges[dep_id]
+                  seen.add(dep_id)
+          missing = sorted(set(ranges) - seen)
+          if missing:
+              raise SystemExit(f"qpm.shared.json: expected dependencies missing: {missing}")
           # Discard the upstream 1.40.8-era resolved lock snapshot. QPM must
           # resolve fresh artifacts for the declared 1.45.3 dependency ranges.
           shared["restoredDependencies"] = []
-          Path("qpm.shared.json").write_text(json.dumps(shared, indent=2) + "\n")
+          shared_path.write_text(json.dumps(shared, indent=2) + "\\n")
 
           template_path = Path("mod.template.json")
           template = json.loads(template_path.read_text())
