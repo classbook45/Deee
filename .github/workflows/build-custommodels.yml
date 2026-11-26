@@ -1,4 +1,4 @@
-name: CustomModels — Operation Beat Saver
+name: CustomModels — Operation Beat Saver 1.45.3
 
 on:
   workflow_dispatch:
@@ -23,15 +23,23 @@ defaults:
 
 jobs:
   build-custommodels:
-    name: Inspect, restore, build and package CustomModels
+    name: Port, inspect, build and validate CustomModels for Beat Saber 1.45.3
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
       MOD_REPOSITORY: https://github.com/Metalit/CustomModels.git
-      MOD_BRANCH: main
-      MOD_ID: custommodels
-      MOD_VERSION: "1.2.1"
-      ANDROID_NDK_VERSION: "28.2.13676358"
+      MOD_COMMIT: 28c049c2d24e0d9a0172d42db07ec80e72a3d62d
+      BEATSABER_PACKAGE_VERSION: "1.45.3_30054"
+      ANDROID_NDK_VERSION: "29.0.14206865"
+      CORDL_RANGE: "^4503.0.0"
+      HOOK_RANGE: "^9.3.0"
+      SCOTLAND2_RANGE: "^0.1.7"
+      PAPERLOG_RANGE: "^4.8.0"
+      METACORE_RANGE: "^2.0.6"
+      CUSTOM_TYPES_RANGE: "^0.21.2"
+      LAPIZ_RANGE: "^0.2.23"
+      CONFIG_UTILS_RANGE: "^3.0.0"
+      BSML_RANGE: "^0.6.5"
 
     steps:
       - name: Checkout workflow repository
@@ -54,14 +62,13 @@ jobs:
           sudo apt-get install -y ninja-build unzip zip
           cmake --version
           ninja --version
-          pwsh --version
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
           packages: platform-tools
 
-      - name: Install the manifest-pinned Android NDK
+      - name: Install Android NDK 29
         run: |
           sdkmanager --install "platform-tools" "ndk;${ANDROID_NDK_VERSION}"
           NDK_PATH="$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION"
@@ -73,8 +80,12 @@ jobs:
           } >> "$GITHUB_ENV"
           grep "Pkg.Revision" "$NDK_PATH/source.properties"
 
-      - name: Install QPM CLI
+      - name: Install PowerShell 7 and QPM CLI
         run: |
+          if ! command -v pwsh >/dev/null 2>&1; then
+            sudo snap install powershell --classic
+          fi
+          pwsh --version
           curl -fsSL -o qpm.zip https://github.com/QuestPackageManager/QPM.CLI/releases/latest/download/qpm-linux-x64.zip
           unzip -oq qpm.zip -d /tmp/qpm
           QPM_BIN="$(find /tmp/qpm -type f -name qpm -print -quit)"
@@ -82,46 +93,137 @@ jobs:
           sudo install -m 755 "$QPM_BIN" /usr/local/bin/qpm
           qpm --version
 
-      - name: Clone CustomModels source
+      - name: Clone pinned CustomModels source
         run: |
           mkdir -p src reports artifacts
-          git clone --recurse-submodules --depth 1 --branch "$MOD_BRANCH" "$MOD_REPOSITORY" src/CustomModels
+          git clone https://github.com/Metalit/CustomModels.git src/CustomModels
           cd src/CustomModels
+          git checkout --detach "$MOD_COMMIT"
           git submodule update --init --recursive
           git rev-parse HEAD | tee ../../reports/source-commit.txt
-          test -f qpm.json
-          test -f qpm.shared.json
-          test -f CMakeLists.txt
-          test -f scripts/build.ps1
-          test -f scripts/createqmod.ps1
+          test "$(git rev-parse HEAD)" = "$MOD_COMMIT"
+          for f in qpm.json qpm.shared.json mod.template.json CMakeLists.txt scripts/build.ps1 scripts/createqmod.ps1; do
+            test -s "$f" || { echo "Missing required source file: $f"; exit 1; }
+          done
+
+      - name: Port manifest and QMOD metadata to Beat Saber 1.45.3
+        working-directory: src/CustomModels
+        run: |
           python3 - <<'PY'
-          import json
+          import json, os
           from pathlib import Path
-          p = Path("qpm.json")
-          data = json.loads(p.read_text())
-          info = data["info"]
-          workspace = data["workspace"]
-          assert info["id"] == "custommodels", info
-          assert info["version"] == "1.2.1", info
-          assert workspace["ndk"] == "^28.2.13676358", workspace
-          assert info.get("additionalData", {}).get("cmake") is True, info
-          print("Manifest verified:", info["id"], info["version"], "NDK", workspace["ndk"])
+
+          target = os.environ["BEATSABER_PACKAGE_VERSION"]
+          ndk = "^29.0.0"
+          ranges = {
+              "beatsaber-hook": os.environ["HOOK_RANGE"],
+              "bs-cordl": os.environ["CORDL_RANGE"],
+              "scotland2": os.environ["SCOTLAND2_RANGE"],
+              "paper2_scotland2": os.environ["PAPERLOG_RANGE"],
+              "metacore": os.environ["METACORE_RANGE"],
+              "custom-types": os.environ["CUSTOM_TYPES_RANGE"],
+              "lapiz": os.environ["LAPIZ_RANGE"],
+              "config-utils": os.environ["CONFIG_UTILS_RANGE"],
+              "bsml": os.environ["BSML_RANGE"],
+          }
+
+          def patch_manifest(path, nested=False):
+              data = json.loads(path.read_text())
+              cfg = data["config"] if nested else data
+              cfg.setdefault("workspace", {})["ndk"] = ndk
+              seen = set()
+              for dep in cfg.get("dependencies", []):
+                  dep_id = dep["id"]
+                  if dep_id in ranges:
+                      dep["versionRange"] = ranges[dep_id]
+                      seen.add(dep_id)
+              missing = sorted(set(ranges) - seen)
+              if missing:
+                  raise SystemExit(f"{path}: expected dependencies missing: {missing}")
+              path.write_text(json.dumps(data, indent=2) + "\n")
+
+          patch_manifest(Path("qpm.json"))
+          shared = json.loads(Path("qpm.shared.json").read_text())
+          patch_manifest(Path("qpm.shared.json"), nested=True)
+          # Discard the upstream 1.40.8-era resolved lock snapshot. QPM must
+          # resolve fresh artifacts for the declared 1.45.3 dependency ranges.
+          shared["restoredDependencies"] = []
+          Path("qpm.shared.json").write_text(json.dumps(shared, indent=2) + "\n")
+
+          template_path = Path("mod.template.json")
+          template = json.loads(template_path.read_text())
+          if template.get("packageId") != "com.beatgames.beatsaber":
+              raise SystemExit("Unexpected Beat Saber package ID")
+          template["packageVersion"] = target
+          template_path.write_text(json.dumps(template, indent=2) + "\n")
+
+          print("Target package:", target)
+          print("NDK range:", ndk)
+          for key, value in ranges.items():
+              print(f"{key}: {value}")
+          print("Cleared stale restoredDependencies lock snapshot.")
           PY
 
-      - name: Resolve NDK and restore QPM dependencies
+      - name: Resolve target NDK and restore 1.45.3 dependency graph
         working-directory: src/CustomModels
         run: |
           qpm ndk resolve -d
           qpm restore
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          d = json.loads(Path("qpm.shared.json").read_text())
+          resolved = {x["dependency"]["id"]: x["version"] for x in d.get("restoredDependencies", [])}
+          required = {
+              "beatsaber-hook": "9.3.0",
+              "bs-cordl": "4503.0.0",
+              "scotland2": "0.1.7",
+              "paper2_scotland2": "4.8.0",
+              "metacore": "2.0.6",
+              "custom-types": "0.21.2",
+              "config-utils": "3.0.0",
+              "bsml": "0.6.5",
+          }
+          errors = []
+          for dep, minimum in required.items():
+              actual = resolved.get(dep)
+              print(f"{dep}: {actual or 'MISSING'} (required baseline {minimum})")
+              if actual != minimum:
+                  errors.append(f"{dep}: expected exact validated baseline {minimum}, got {actual}")
+          if errors:
+              raise SystemExit("\n".join(errors))
+          Path("../../reports/resolved-dependencies.json").write_text(json.dumps(resolved, indent=2) + "\n")
+          PY
           test -d extern/includes
           test -d extern/libs
           {
-            echo "## Resolved dependency inventory"
-            echo '### Headers'
-            find extern/includes -mindepth 1 -maxdepth 2 -type d | sort | head -100
-            echo '### Libraries'
+            echo "### Headers"
+            find extern/includes -mindepth 1 -maxdepth 2 -type d | sort | head -120
+            echo "### Libraries"
             find extern/libs -maxdepth 1 -type f -printf '%f\n' | sort
           } | tee ../../reports/dependencies.txt
+
+      - name: Check source API migration markers
+        working-directory: src/CustomModels
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          files = [Path("include/hooks.hpp"), Path("src/hooks.cpp"), Path("src/main.cpp")]
+          for p in files:
+              if not p.is_file():
+                  raise SystemExit(f"Missing source file: {p}")
+          hooks = Path("include/hooks.hpp").read_text()
+          main = Path("src/main.cpp").read_text()
+          checks = {
+              "hook implementation includes modern hook header": "beatsaber-hook/shared/utils/hooking.hpp" in hooks,
+              "custom-types auto registration call": "custom_types::Register::AutoRegister()" in main,
+              "IL2CPP initialization before mod hooks": main.find("il2cpp_functions::Init()") < main.find("Hooks::Install()"),
+          }
+          for label, ok in checks.items():
+              print(f"[{'PASS' if ok else 'FAIL'}] {label}")
+          if not all(checks.values()):
+              raise SystemExit("Source API preflight failed; refusing to package.")
+          PY
 
       - name: Build native library and create QMOD
         working-directory: src/CustomModels
@@ -139,10 +241,11 @@ jobs:
           cp build/libcustommodels.so ../../artifacts/
           cp build/debug/libcustommodels.so ../../artifacts/debug_libcustommodels.so
 
-      - name: Validate QMOD and ARM64 native library
+      - name: Validate QMOD metadata, archive and ARM64 ELF
         run: |
           python3 - <<'PY'
-          import pathlib, struct, zipfile
+          import json, pathlib, struct, zipfile
+          expected = "1.45.3_30054"
           qmod = pathlib.Path("artifacts/CustomModels.qmod")
           so = pathlib.Path("artifacts/libcustommodels.so")
           assert qmod.is_file() and qmod.stat().st_size > 0, "QMOD missing or empty"
@@ -155,10 +258,16 @@ jobs:
               bad = z.testzip()
               assert bad is None, f"Corrupt QMOD entry: {bad}"
               names = z.namelist()
-              assert any(n.endswith("libcustommodels.so") for n in names), "QMOD does not contain libcustommodels.so"
+              metadata = next((n for n in names if n.endswith("mod.json")), None)
+              assert metadata, "QMOD does not contain mod.json"
+              mod = json.loads(z.read(metadata))
+              assert mod.get("packageId") == "com.beatgames.beatsaber", mod
+              assert mod.get("packageVersion") == expected, mod.get("packageVersion")
+              assert any(n.endswith("libcustommodels.so") for n in names), "QMOD lacks native library"
+              print("QMOD packageVersion:", mod["packageVersion"])
               print("QMOD entries:")
               print("\n".join(names))
-          print("Validated ARM64 ELF and QMOD archive.")
+          print("Validated ARM64 ELF and 1.45.3 QMOD metadata.")
           PY
 
       - name: Write build summary
@@ -166,22 +275,23 @@ jobs:
         run: |
           mkdir -p reports
           {
-            echo "# CustomModels build report"
+            echo "# CustomModels — Beat Saber 1.45.3 build report"
             echo
-            echo "- Repository: $MOD_REPOSITORY"
-            echo "- Branch: $MOD_BRANCH"
-            echo "- Mod ID: $MOD_ID"
-            echo "- Mod version: $MOD_VERSION"
+            echo "- Target package: $BEATSABER_PACKAGE_VERSION"
+            echo "- Source commit: $MOD_COMMIT"
+            echo "- Hook range: $HOOK_RANGE"
+            echo "- CORDL range: $CORDL_RANGE"
             echo "- Android NDK: $ANDROID_NDK_VERSION"
+            echo "- This workflow only builds and validates artifacts; it never installs to a headset."
             echo
-            echo "See the source commit, dependency inventory, and build log in this artifact."
+            echo "A passing compile and archive check do not by themselves prove runtime compatibility."
           } > reports/BUILD-REPORT.md
 
-      - name: Upload QMOD, native libraries and diagnostics
+      - name: Upload QMOD and diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: CustomModels-build-results
+          name: CustomModels-BeatSaber-1.45.3-results
           path: |
             artifacts/
             reports/
