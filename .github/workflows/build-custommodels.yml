@@ -1,0 +1,189 @@
+name: CustomModels — Operation Beat Saver
+
+on:
+  workflow_dispatch:
+    inputs:
+      clean_build:
+        description: "Delete the previous CMake build directory"
+        required: true
+        type: boolean
+        default: true
+  push:
+    branches:
+      - operation/custommodels
+    paths:
+      - ".github/workflows/build-custommodels.yml"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-custommodels:
+    name: Inspect, restore, build and package CustomModels
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      MOD_REPOSITORY: https://github.com/Metalit/CustomModels.git
+      MOD_BRANCH: main
+      MOD_ID: custommodels
+      MOD_VERSION: "1.2.1"
+      ANDROID_NDK_VERSION: "28.2.13676358"
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python and Java
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build unzip zip
+          cmake --version
+          ninja --version
+          pwsh --version
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install the manifest-pinned Android NDK
+        run: |
+          sdkmanager --install "platform-tools" "ndk;${ANDROID_NDK_VERSION}"
+          NDK_PATH="$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION"
+          test -f "$NDK_PATH/source.properties"
+          {
+            echo "ANDROID_NDK_HOME=$NDK_PATH"
+            echo "ANDROID_NDK_ROOT=$NDK_PATH"
+            echo "ANDROID_NDK_LATEST_HOME=$NDK_PATH"
+          } >> "$GITHUB_ENV"
+          grep "Pkg.Revision" "$NDK_PATH/source.properties"
+
+      - name: Install QPM CLI
+        run: |
+          curl -fsSL -o qpm.zip https://github.com/QuestPackageManager/QPM.CLI/releases/latest/download/qpm-linux-x64.zip
+          unzip -oq qpm.zip -d /tmp/qpm
+          QPM_BIN="$(find /tmp/qpm -type f -name qpm -print -quit)"
+          test -n "$QPM_BIN"
+          sudo install -m 755 "$QPM_BIN" /usr/local/bin/qpm
+          qpm --version
+
+      - name: Clone CustomModels source
+        run: |
+          mkdir -p src reports artifacts
+          git clone --recurse-submodules --depth 1 --branch "$MOD_BRANCH" "$MOD_REPOSITORY" src/CustomModels
+          cd src/CustomModels
+          git submodule update --init --recursive
+          git rev-parse HEAD | tee ../../reports/source-commit.txt
+          test -f qpm.json
+          test -f qpm.shared.json
+          test -f CMakeLists.txt
+          test -f scripts/build.ps1
+          test -f scripts/createqmod.ps1
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path("qpm.json")
+          data = json.loads(p.read_text())
+          info = data["info"]
+          workspace = data["workspace"]
+          assert info["id"] == "custommodels", info
+          assert info["version"] == "1.2.1", info
+          assert workspace["ndk"] == "^28.2.13676358", workspace
+          assert info.get("additionalData", {}).get("cmake") is True, info
+          print("Manifest verified:", info["id"], info["version"], "NDK", workspace["ndk"])
+          PY
+
+      - name: Resolve NDK and restore QPM dependencies
+        working-directory: src/CustomModels
+        run: |
+          qpm ndk resolve -d
+          qpm restore
+          test -d extern/includes
+          test -d extern/libs
+          {
+            echo "## Resolved dependency inventory"
+            echo '### Headers'
+            find extern/includes -mindepth 1 -maxdepth 2 -type d | sort | head -100
+            echo '### Libraries'
+            find extern/libs -maxdepth 1 -type f -printf '%f\n' | sort
+          } | tee ../../reports/dependencies.txt
+
+      - name: Build native library and create QMOD
+        working-directory: src/CustomModels
+        env:
+          CLEAN_BUILD: ${{ inputs.clean_build }}
+        run: |
+          if [[ "$CLEAN_BUILD" == "true" ]]; then
+            rm -rf build
+          fi
+          qpm s qmod 2>&1 | tee ../../reports/build-and-package.log
+          test -s CustomModels.qmod
+          test -s build/libcustommodels.so
+          test -s build/debug/libcustommodels.so
+          cp CustomModels.qmod ../../artifacts/
+          cp build/libcustommodels.so ../../artifacts/
+          cp build/debug/libcustommodels.so ../../artifacts/debug_libcustommodels.so
+
+      - name: Validate QMOD and ARM64 native library
+        run: |
+          python3 - <<'PY'
+          import pathlib, struct, zipfile
+          qmod = pathlib.Path("artifacts/CustomModels.qmod")
+          so = pathlib.Path("artifacts/libcustommodels.so")
+          assert qmod.is_file() and qmod.stat().st_size > 0, "QMOD missing or empty"
+          assert so.is_file() and so.stat().st_size > 0, "Native library missing or empty"
+          data = so.read_bytes()
+          assert data[:4] == b"\x7fELF", "Native library is not ELF"
+          assert data[4] == 2 and data[5] == 1, "Expected ELF64 little-endian"
+          assert struct.unpack("<H", data[18:20])[0] == 183, "Expected AArch64 machine type"
+          with zipfile.ZipFile(qmod) as z:
+              bad = z.testzip()
+              assert bad is None, f"Corrupt QMOD entry: {bad}"
+              names = z.namelist()
+              assert any(n.endswith("libcustommodels.so") for n in names), "QMOD does not contain libcustommodels.so"
+              print("QMOD entries:")
+              print("\n".join(names))
+          print("Validated ARM64 ELF and QMOD archive.")
+          PY
+
+      - name: Write build summary
+        if: always()
+        run: |
+          mkdir -p reports
+          {
+            echo "# CustomModels build report"
+            echo
+            echo "- Repository: $MOD_REPOSITORY"
+            echo "- Branch: $MOD_BRANCH"
+            echo "- Mod ID: $MOD_ID"
+            echo "- Mod version: $MOD_VERSION"
+            echo "- Android NDK: $ANDROID_NDK_VERSION"
+            echo
+            echo "See the source commit, dependency inventory, and build log in this artifact."
+          } > reports/BUILD-REPORT.md
+
+      - name: Upload QMOD, native libraries and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CustomModels-build-results
+          path: |
+            artifacts/
+            reports/
+          if-no-files-found: warn
+          retention-days: 14
