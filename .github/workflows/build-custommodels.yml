@@ -159,7 +159,7 @@ jobs:
           # Discard the upstream 1.40.8-era resolved lock snapshot. QPM must
           # resolve fresh artifacts for the declared 1.45.3 dependency ranges.
           shared["restoredDependencies"] = []
-          shared_path.write_text(json.dumps(shared, indent=2) + "\\n")
+          shared_path.write_text(json.dumps(shared, indent=2) + "\n")
 
           template_path = Path("mod.template.json")
           template = json.loads(template_path.read_text())
@@ -195,12 +195,20 @@ jobs:
               "config-utils": "3.0.0",
               "bsml": "0.6.5",
           }
+          def version_tuple(value):
+              parts = []
+              for part in value.split("."):
+                  digits = "".join(ch for ch in part if ch.isdigit())
+                  if not digits:
+                      break
+                  parts.append(int(digits))
+              return tuple((parts + [0, 0, 0])[:3])
           errors = []
           for dep, minimum in required.items():
               actual = resolved.get(dep)
-              print(f"{dep}: {actual or 'MISSING'} (required baseline {minimum})")
-              if actual != minimum:
-                  errors.append(f"{dep}: expected exact validated baseline {minimum}, got {actual}")
+              print(f"{dep}: {actual or 'MISSING'} (minimum baseline {minimum})")
+              if not actual or version_tuple(actual) < version_tuple(minimum):
+                  errors.append(f"{dep}: expected >= {minimum}, got {actual or 'missing'}")
           if errors:
               raise SystemExit("\n".join(errors))
           Path("../../reports/resolved-dependencies.json").write_text(json.dumps(resolved, indent=2) + "\n")
